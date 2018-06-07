@@ -1,109 +1,138 @@
 extern crate clap;
-extern crate futures;
+extern crate url;
 extern crate hyper;
-extern crate tokio_core;
+extern crate hyper_tls;
 extern crate serde;
 extern crate serde_json;
-#[macro_use] extern crate serde_derive;
+// #[macro_use] extern crate serde_derive;
 
-use std::collections::HashMap;
+mod parsers;
+
 use std::io::{self, Write};
 
-use clap::{Arg, App};
-use futures::{Future, Stream};
-use hyper::{Client, Method, Request, Uri};
-use tokio_core::reactor::Core;
+use clap::{Arg, App, ArgGroup, AppSettings};
+use hyper::{Client, Request, Uri, Body};
+use hyper::rt::{self, lazy, Future, Stream};
+use hyper_tls::HttpsConnector;
 
-fn main() -> Result<(), impl ::std::error::Error> {
+use parsers::BodyFormat;
+
+const METHODS: [&str; 4] = ["GET", "POST", "PUT", "DELETE"];
+
+fn main() { // -> Result<(), impl ::std::error::Error> {
     let matches = App::new("REQuesteR")
         .version("1.0.0")
         .author("Livio Ribeiro")
         .about("Perform http requests")
-        .arg(Arg::with_name("method_get")
+        .setting(AppSettings::ArgRequiredElseHelp)
+        .group(ArgGroup::with_name("method")
+            .args(&METHODS))
+        .arg(Arg::with_name("GET")
             .long("get")
-            .conflicts_with_all(&["method_post", "method_put", "method_delete"]))
-        .arg(Arg::with_name("method_post")
-            .long("post")
-            .conflicts_with_all(&["method_get", "method_put", "method_delete"]))
-        .arg(Arg::with_name("method_put")
-            .long("put")
-            .conflicts_with_all(&["method_get", "method_post", "method_delete"]))
-        .arg(Arg::with_name("method_delete")
+            .conflicts_with("body"))
+        .arg(Arg::with_name("POST")
+            .long("post"))
+        .arg(Arg::with_name("PUT")
+            .long("put"))
+        .arg(Arg::with_name("DELETE")
             .long("delete")
-            .conflicts_with_all(&["method_get", "method_post", "method_put"]))
+            .conflicts_with("body"))
         .arg(Arg::with_name("url")
             .required(true)
             .takes_value(true))
+        .arg(Arg::with_name("json")
+            .long("json"))
+        .arg(Arg::with_name("form")
+            .long("form"))
         .arg(Arg::with_name("body")
             .short("B")
             .long("body")
             .takes_value(true)
             .multiple(true)
-            .number_of_values(2))
+            .number_of_values(2)
+            .value_names(&["name", "value"]))
         .arg(Arg::with_name("query")
             .short("Q")
             .long("query")
             .takes_value(true)
             .multiple(true)
-            .number_of_values(2))
+            .number_of_values(2)
+            .value_names(&["name", "value"]))
         .arg(Arg::with_name("header")
             .short("H")
             .long("header")
             .takes_value(true)
             .multiple(true)
-            .number_of_values(2))
+            .number_of_values(2)
+            .value_names(&["name", "value"]))
         .get_matches();
 
-    let body: HashMap<String, String> = if let Some(body) = matches.values_of("body") {
-        let (keys, values): (Vec<(usize, String)>, Vec<(usize, String)>) = body.into_iter()
-            .map(|x| x.to_owned())
-            .enumerate()
-            .partition(|(i, _)| i % 2 == 0);
-        keys.into_iter().map(|(_, x)| x).zip(values.into_iter().map(|(_, x)| x)).collect()
+    let mut url = matches.value_of("url").unwrap().to_owned();
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        url = format!("http://{}", url);
+    }
+
+    if let Some(query) = matches.values_of("query") {
+        let query_string = parsers::query_string(query);
+        url = format!("{}?{}", url, query_string);
+    }
+
+    let uri: Uri = url.parse().unwrap();
+
+    let mut request_builder = if matches.is_present("GET") {
+        Request::get(uri)
+    } else if matches.is_present("POST") {
+        Request::post(uri)
+    } else if matches.is_present("PUT") {
+        Request::put(uri)
+    } else if matches.is_present("DELETE") {
+        Request::delete(uri)
     } else {
-        HashMap::new()
+        if matches.is_present("body") || matches.is_present("json") || matches.is_present("form") {
+            Request::post(uri)
+        } else {
+            Request::get(uri)
+        }
     };
 
-    let method = if matches.is_present("method_get") {
-        Method::Get
-    } else if matches.is_present("method_post") {
-        Method::Post
-    } else if matches.is_present("method_put") {
-        Method::Put
-    } else if matches.is_present("method_delete") {
-        Method::Delete
+    if let Some(headers) = matches.values_of("headers") {
+        for (key, value) in parsers::headers(headers) {
+            request_builder.header(key, value);
+        }
+    }
+
+    let request_body: Body = if let Some(body) = matches.values_of("body") {
+        let format = if matches.is_present("form") {
+            BodyFormat::FORM
+        } else {
+            BodyFormat::JSON
+        };
+        parsers::body(body, format).into()
     } else {
-        Method::Get
+        Body::empty()
     };
 
-    let url = matches.value_of("url").unwrap();
+    let request = request_builder.body(request_body).unwrap();
 
-    let mut core = Core::new()?;
-    let client = Client::new(&core.handle());
+    rt::run(lazy(|| {
+        let https = HttpsConnector::new(4).expect("TLS initialization failed");
+        let client = Client::builder().build::<_, hyper::Body>(https);
 
-    let uri: Uri = url.parse()?;
-    let req = match method {
-        Method::Get | Method::Delete => {
-            client.request(Request::new(method, uri))
-        },
-        Method::Post | Method::Put => {
-            let mut req = Request::new(method, uri);
-            req.set_body(serde_json::to_string(&body).unwrap());
-            client.request(req)
-        },
-        _ => unreachable!()
-    };
-
-    let work = req.and_then(|res| {
-        println!("Response: {}", res.status());
-
-        res.body().for_each(|chunk| {
-            io::stdout()
-                .write_all(&chunk)
-                .map(|_| ())
-                .map_err(From::from)
-        })
-    });
-
-    core.run(work)
+        client.request(request).and_then(|res| {
+            println!("Response: {}", res.status());
+            res
+                .into_body()
+                // Body is a stream, so as each chunk arrives...
+                .for_each(|chunk| {
+                    io::stdout()
+                        .write_all(&chunk)
+                        .map_err(|e| {
+                            panic!("example expects stdout is open, error={}", e)
+                        })
+                })
+            })
+            .map_err(|err| {
+                println!("Error: {}", err);
+            })
+    }));
 }
