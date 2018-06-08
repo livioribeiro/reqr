@@ -4,14 +4,13 @@ extern crate hyper;
 extern crate hyper_tls;
 extern crate serde;
 extern crate serde_json;
-// #[macro_use] extern crate serde_derive;
 
 mod parsers;
 
 use std::io::{self, Write};
 
-use clap::{Arg, App, ArgGroup, AppSettings};
-use hyper::{Client, Request, Uri, Body};
+use clap::{Arg, App, AppSettings};
+use hyper::{Client, Request, Body};
 use hyper::rt::{self, lazy, Future, Stream};
 use hyper_tls::HttpsConnector;
 
@@ -25,18 +24,9 @@ fn main() { // -> Result<(), impl ::std::error::Error> {
         .author("Livio Ribeiro")
         .about("Perform http requests")
         .setting(AppSettings::ArgRequiredElseHelp)
-        .group(ArgGroup::with_name("method")
-            .args(&METHODS))
-        .arg(Arg::with_name("GET")
-            .long("get")
-            .conflicts_with("body"))
-        .arg(Arg::with_name("POST")
-            .long("post"))
-        .arg(Arg::with_name("PUT")
-            .long("put"))
-        .arg(Arg::with_name("DELETE")
-            .long("delete")
-            .conflicts_with("body"))
+        .arg(Arg::with_name("method")
+            .long("method")
+            .possible_values(&METHODS))
         .arg(Arg::with_name("url")
             .required(true)
             .takes_value(true))
@@ -68,30 +58,25 @@ fn main() { // -> Result<(), impl ::std::error::Error> {
         .get_matches();
 
     let mut url = matches.value_of("url").unwrap().to_owned();
+
     if !url.starts_with("http://") && !url.starts_with("https://") {
         url = format!("http://{}", url);
     }
 
-    if let Some(query) = matches.values_of("query") {
-        let query_string = parsers::query_string(query);
-        url = format!("{}?{}", url, query_string);
-    }
+    let maybe_query = matches.values_of("query");
+    let uri = parsers::uri(&url, maybe_query).unwrap();
 
-    let uri: Uri = url.parse().unwrap();
-
-    let mut request_builder = if matches.is_present("GET") {
-        Request::get(uri)
-    } else if matches.is_present("POST") {
-        Request::post(uri)
-    } else if matches.is_present("PUT") {
-        Request::put(uri)
-    } else if matches.is_present("DELETE") {
-        Request::delete(uri)
-    } else {
-        if matches.is_present("body") || matches.is_present("json") || matches.is_present("form") {
-            Request::post(uri)
-        } else {
-            Request::get(uri)
+    let mut request_builder = match matches.value_of("method") {
+        Some("GET") => Request::get(uri),
+        Some("POST") => Request::post(uri),
+        Some("PUT") => Request::put(uri),
+        Some("DELETE") => Request::delete(uri),
+        _ => {
+            if matches.is_present("body") || matches.is_present("json") || matches.is_present("form") {
+                Request::post(uri)
+            } else {
+                Request::get(uri)
+            }
         }
     };
 
