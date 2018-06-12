@@ -1,37 +1,51 @@
-extern crate clap;
+#[macro_use] extern crate clap;
 extern crate url;
 extern crate hyper;
 extern crate hyper_tls;
 extern crate serde;
 extern crate serde_json;
+extern crate syntect;
 
 mod parsers;
 
-use std::io::{self, Write};
+// use std::io::{self, Write};
 
 use clap::{Arg, App, AppSettings};
 use hyper::{Client, Request, Body};
 use hyper::rt::{self, lazy, Future, Stream};
 use hyper_tls::HttpsConnector;
 
+use syntect::easy::HighlightLines;
+use syntect::parsing::SyntaxSet;
+use syntect::highlighting::{ThemeSet, Style};
+use syntect::util::as_24_bit_terminal_escaped;
+
 use parsers::BodyFormat;
 
-const METHODS: [&str; 4] = ["GET", "POST", "PUT", "DELETE"];
-
-fn main() { // -> Result<(), impl ::std::error::Error> {
+fn main() {
     let matches = App::new("REQuesteR")
-        .version("1.0.0")
-        .author("Livio Ribeiro")
-        .about("Perform http requests")
+        .version(crate_version!())
+        .author(crate_authors!())
+        .about(crate_description!())
         .setting(AppSettings::ArgRequiredElseHelp)
         .arg(Arg::with_name("method")
             .long("method")
-            .possible_values(&METHODS))
+            .short("m")
+            .case_insensitive(true)
+            .possible_values(&["GET", "POST", "PUT", "DELETE"])
+            .default_value_if("body", None, "POST")
+            .default_value_if("form", None, "POST")
+            .default_value_if("json", None, "POST")
+            .default_value("GET"))
         .arg(Arg::with_name("url")
             .required(true)
             .takes_value(true))
+        .arg(Arg::with_name("output")
+            .long("output")
+            .short("o"))
         .arg(Arg::with_name("json")
-            .long("json"))
+            .long("json")
+            .conflicts_with("form"))
         .arg(Arg::with_name("form")
             .long("form"))
         .arg(Arg::with_name("body")
@@ -57,27 +71,17 @@ fn main() { // -> Result<(), impl ::std::error::Error> {
             .value_names(&["name", "value"]))
         .get_matches();
 
-    let mut url = matches.value_of("url").unwrap().to_owned();
-
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        url = format!("http://{}", url);
-    }
+    let url = matches.value_of("url").unwrap().to_owned();
 
     let maybe_query = matches.values_of("query");
-    let uri = parsers::uri(&url, maybe_query).unwrap();
+    let uri = parsers::uri(url, maybe_query).unwrap();
 
-    let mut request_builder = match matches.value_of("method") {
-        Some("GET") => Request::get(uri),
-        Some("POST") => Request::post(uri),
-        Some("PUT") => Request::put(uri),
-        Some("DELETE") => Request::delete(uri),
-        _ => {
-            if matches.is_present("body") || matches.is_present("json") || matches.is_present("form") {
-                Request::post(uri)
-            } else {
-                Request::get(uri)
-            }
-        }
+    let mut request_builder = match matches.value_of("method").unwrap_or("GET") {
+        "GET" => Request::get(uri),
+        "POST" => Request::post(uri),
+        "PUT" => Request::put(uri),
+        "DELETE" => Request::delete(uri),
+        _ => unreachable!(),
     };
 
     if let Some(headers) = matches.values_of("headers") {
@@ -107,13 +111,21 @@ fn main() { // -> Result<(), impl ::std::error::Error> {
             println!("Response: {}", res.status());
             res
                 .into_body()
-                // Body is a stream, so as each chunk arrives...
-                .for_each(|chunk| {
-                    io::stdout()
-                        .write_all(&chunk)
-                        .map_err(|e| {
-                            panic!("example expects stdout is open, error={}", e)
-                        })
+                .concat2()
+                .map(|chunk| String::from_utf8(chunk.to_vec()).unwrap())
+                .and_then(|s| {
+                    let ps = SyntaxSet::load_defaults_nonewlines();
+                    let ts = ThemeSet::load_defaults();
+                    let syntax = ps.find_syntax_by_extension("html").unwrap();
+                    let mut h = HighlightLines::new(syntax, &ts.themes["base16-ocean.dark"]);
+
+                    for line in s.lines() {
+                        let ranges: Vec<(Style, &str)> = h.highlight(line);
+                        let escaped = as_24_bit_terminal_escaped(&ranges[..], true);
+                        println!("{}", escaped);
+                    }
+
+                    Ok(())
                 })
             })
             .map_err(|err| {

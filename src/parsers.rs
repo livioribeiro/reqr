@@ -9,7 +9,11 @@ pub enum BodyFormat {
     JSON, FORM
 }
 
-pub fn uri<'a, T: Iterator<Item = &'a str>>(url: &str, query: Option<T>) -> Result<Uri, String> {
+pub fn uri<'a, T: Iterator<Item = &'a str>>(mut url: String, query: Option<T>) -> Result<Uri, String> {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        url = format!("http://{}", url);
+    }
+
     if let Some(query) = query {
         let (keys, values): (Vec<(usize, &str)>, Vec<(usize, &str)>) = query.into_iter()
             .enumerate()
@@ -17,7 +21,7 @@ pub fn uri<'a, T: Iterator<Item = &'a str>>(url: &str, query: Option<T>) -> Resu
         let query = keys.into_iter().map(|(_, x)| x)
             .zip(values.into_iter().map(|(_, x)| x));
 
-        let parsed = Url::parse_with_params(url, query).map_err(|x| format!("{}", x))?;
+        let parsed = Url::parse_with_params(&url, query).map_err(|x| format!("{}", x))?;
         Uri::from_shared(parsed.as_str().as_bytes().into()).map_err(|x| format!("{}", x))
     } else {
         url.parse().map_err(|x| format!("{}", x))
